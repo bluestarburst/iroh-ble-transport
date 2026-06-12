@@ -11,7 +11,7 @@ keywords = ["bluetooth", "ble", "iroh", "p2p", "transport"]
 categories = ["network-programming"]
 
 [features]
-testing = []
+testing = ["blew/testing"]
 
 [dependencies]
 blew = "0.3"

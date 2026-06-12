@@ -1,6 +1,7 @@
 pub mod error;
 pub mod transport;
 
+pub use blew;
 pub use blew::BlewError;
 pub use blew::central::{CentralEvent, ScanFilter, WriteType};
 pub use blew::gatt::props::{AttributePermissions, CharacteristicProperties};
