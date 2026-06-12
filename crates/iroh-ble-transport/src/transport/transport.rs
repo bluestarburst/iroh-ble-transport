@@ -14,7 +14,9 @@ use blew::peripheral::AdvertisingConfig;
 use blew::{BlewError, Central, Peripheral};
 use bytes::Bytes;
 use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item};
-use iroh::endpoint::transports::{Addr, CustomEndpoint, CustomSender, CustomTransport, Transmit};
+use iroh::endpoint::transports::{
+    CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit,
+};
 use iroh_base::{CustomAddr, EndpointId, TransportAddr};
 use n0_watcher::Watchable;
 use parking_lot::Mutex;
@@ -720,9 +722,9 @@ impl CustomEndpoint for BleEndpoint {
         cx: &mut Context<'_>,
         bufs: &mut [io::IoSliceMut<'_>],
         metas: &mut [noq_udp::RecvMeta],
-        source_addrs: &mut [Addr],
+        recv_infos: &mut [RecvInfo],
     ) -> Poll<io::Result<usize>> {
-        let n = bufs.len().min(metas.len()).min(source_addrs.len());
+        let n = bufs.len().min(metas.len()).min(recv_infos.len());
         if n == 0 {
             return Poll::Ready(Ok(0));
         }
@@ -765,7 +767,7 @@ impl CustomEndpoint for BleEndpoint {
                     bufs[filled][..packet.data.len()].copy_from_slice(&packet.data);
                     metas[filled].len = packet.data.len();
                     metas[filled].stride = packet.data.len();
-                    source_addrs[filled] = Addr::Custom(token_custom_addr(token));
+                    recv_infos[filled] = RecvInfo::new(token_custom_addr(token), None);
                     self.rx_bytes
                         .fetch_add(packet.data.len() as u64, Ordering::Relaxed);
                     filled += 1;
@@ -803,6 +805,7 @@ impl CustomSender for BleSender {
         &self,
         cx: &mut Context<'_>,
         dst: &CustomAddr,
+        _src: Option<&CustomAddr>,
         transmit: &Transmit<'_>,
     ) -> Poll<io::Result<()>> {
         let token = match parse_token_addr(dst) {
@@ -1588,7 +1591,7 @@ mod tests {
 
         let transmit = test_transmit(b"hello");
         assert!(matches!(
-            CustomSender::poll_send(&sender, &mut cx, &token_custom_addr(token), &transmit),
+            CustomSender::poll_send(&sender, &mut cx, &token_custom_addr(token), None, &transmit),
             Poll::Ready(Ok(()))
         ));
 

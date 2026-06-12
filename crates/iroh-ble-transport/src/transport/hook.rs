@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use blew::DeviceId;
-use iroh::endpoint::{AfterHandshakeOutcome, ConnectionInfo, EndpointHooks};
+use iroh::endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks, VarInt};
 use iroh_base::{EndpointId, TransportAddr};
 use tokio::sync::mpsc;
 
@@ -124,15 +124,14 @@ impl ActiveConnections {
 }
 
 impl EndpointHooks for BleDedupHook {
-    async fn after_handshake<'a>(&'a self, conn: &'a ConnectionInfo) -> AfterHandshakeOutcome {
+    async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
         let remote_endpoint = conn.remote_id();
         let token = conn
             .paths()
             .into_iter()
-            .filter(|path| !path.is_closed())
             .find_map(|path| match path.remote_addr() {
                 TransportAddr::Custom(addr) if addr.id() == BLE_TRANSPORT_ID => {
-                    parse_token_addr(addr).ok()
+                    parse_token_addr(&addr).ok()
                 }
                 _ => None,
             });
@@ -164,7 +163,7 @@ impl EndpointHooks for BleDedupHook {
                         evicted_devices: Vec::new(),
                     });
                     return AfterHandshakeOutcome::Reject {
-                        error_code: noq_proto::VarInt::from_u32(0),
+                        error_code: VarInt::from_u32(0),
                         reason: b"ble_conflict".to_vec(),
                     };
                 }

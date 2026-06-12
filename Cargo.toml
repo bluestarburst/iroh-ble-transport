@@ -1,13 +1,11 @@
 [workspace]
 members = [
     "crates/iroh-ble-transport",
-    "demos/protocol",
-    "demos/iroh-ble-chat/src-tauri",
 ]
 resolver = "2"
 
 [workspace.package]
-rust-version = "1.95"
+rust-version = "1.91"
 
 [workspace.metadata.release]
 consolidate-commits = false
