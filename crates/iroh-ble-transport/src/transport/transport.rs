@@ -1,6 +1,8 @@
 //! `BleTransport` — iroh `CustomTransport` implementation driven by the
 //! registry actor and a `BlewDriver`.
 
+use std::fmt::Display;
+use std::future::Future;
 use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -649,6 +651,168 @@ impl BleTransport {
         Ok(true)
     }
 
+    /// Private hardware-lab probe that exercises the native BLE path up to the
+    /// point where iroh would create a GATT data pipe.
+    ///
+    /// The probe is deliberately stage-oriented so a real device run can prove
+    /// whether failure happens at CoreBluetooth connect, service discovery,
+    /// characteristic discovery, notification subscription, or optional control
+    /// reads. It should not be called concurrently with a normal iroh dial to
+    /// the same endpoint.
+    pub async fn probe_endpoint_connection(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> BleConnectProbeReport {
+        let mut report = BleConnectProbeReport {
+            endpoint_id: endpoint_id.to_string(),
+            service_uuid: Self::service_uuid_for_endpoint(&endpoint_id).to_string(),
+            device_id: None,
+            stages: Vec::new(),
+            services: Vec::new(),
+            success: false,
+            error: None,
+        };
+        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
+        let Some(device_id) = self.routing.scan_hint_for_prefix(&prefix) else {
+            report.push_stage("scan_hint", false, "no scan hint for endpoint");
+            report.error = Some("no scan hint for endpoint".to_string());
+            return report;
+        };
+        report.device_id = Some(device_id.to_string());
+        report.push_stage("scan_hint", true, "scan hint found");
+
+        if let Err(error) = probe_stage(
+            &mut report,
+            "connect",
+            std::time::Duration::from_secs(25),
+            self.central.connect(&device_id),
+        )
+        .await
+        {
+            report.error = Some(error);
+            return report;
+        }
+
+        let services = match probe_stage(
+            &mut report,
+            "discover_services",
+            std::time::Duration::from_secs(15),
+            self.central.discover_services(&device_id),
+        )
+        .await
+        {
+            Ok(services) => services,
+            Err(error) => {
+                report.error = Some(error);
+                let _ = self.central.disconnect(&device_id).await;
+                return report;
+            }
+        };
+
+        report.services = services
+            .iter()
+            .map(|service| BleConnectProbeService {
+                uuid: service.uuid.to_string(),
+                characteristics: service
+                    .characteristics
+                    .iter()
+                    .map(|characteristic| characteristic.uuid.to_string())
+                    .collect(),
+            })
+            .collect();
+
+        let expected = [
+            IROH_C2P_CHAR_UUID,
+            IROH_P2C_CHAR_UUID,
+            IROH_PSM_CHAR_UUID,
+            IROH_VERSION_CHAR_UUID,
+        ];
+        let Some(iroh_service) = services
+            .iter()
+            .find(|service| service.uuid == IROH_SERVICE_UUID)
+        else {
+            report.push_stage("validate_iroh_service", false, "iroh GATT service missing");
+            report.error = Some("iroh GATT service missing".to_string());
+            let _ = self.central.disconnect(&device_id).await;
+            return report;
+        };
+        let missing = expected
+            .iter()
+            .filter(|uuid| {
+                !iroh_service
+                    .characteristics
+                    .iter()
+                    .any(|characteristic| characteristic.uuid == **uuid)
+            })
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            report.push_stage(
+                "validate_iroh_characteristics",
+                false,
+                format!("missing characteristics: {}", missing.join(",")),
+            );
+            report.error = Some(format!(
+                "missing iroh characteristics: {}",
+                missing.join(",")
+            ));
+            let _ = self.central.disconnect(&device_id).await;
+            return report;
+        }
+        report.push_stage(
+            "validate_iroh_characteristics",
+            true,
+            format!("{} characteristics found", expected.len()),
+        );
+
+        if let Err(error) = probe_stage(
+            &mut report,
+            "subscribe_p2c",
+            std::time::Duration::from_secs(15),
+            self.central
+                .subscribe_characteristic(&device_id, IROH_P2C_CHAR_UUID),
+        )
+        .await
+        {
+            report.error = Some(error);
+            let _ = self.central.disconnect(&device_id).await;
+            return report;
+        }
+
+        match probe_stage(
+            &mut report,
+            "read_version",
+            std::time::Duration::from_secs(5),
+            self.central
+                .read_characteristic(&device_id, IROH_VERSION_CHAR_UUID),
+        )
+        .await
+        {
+            Ok(bytes) => report.push_stage(
+                "parse_version",
+                !bytes.is_empty() && bytes[0] == PROTOCOL_VERSION,
+                if bytes.is_empty() {
+                    "empty version".to_string()
+                } else {
+                    format!("got={} want={}", bytes[0], PROTOCOL_VERSION)
+                },
+            ),
+            Err(error) => {
+                report.error = Some(error);
+                let _ = self.central.disconnect(&device_id).await;
+                return report;
+            }
+        }
+
+        report.success = report.error.is_none()
+            && report
+                .stages
+                .iter()
+                .all(|stage| stage.ok || stage.name == "parse_version");
+        let _ = self.central.disconnect(&device_id).await;
+        report
+    }
+
     /// Public-facing peer snapshot. Filters out `Unknown` (pre-state internal
     /// construction) and `Dead` (tombstones kept around for `DEAD_GC_TTL`
     /// dedup) so the returned list only contains peers that are actionable
@@ -704,6 +868,89 @@ impl BlePeerInfo {
             consecutive_failures,
             connect_path,
             verified_endpoint,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BleConnectProbeReport {
+    pub endpoint_id: String,
+    pub service_uuid: String,
+    pub device_id: Option<String>,
+    pub stages: Vec<BleConnectProbeStage>,
+    pub services: Vec<BleConnectProbeService>,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+impl BleConnectProbeReport {
+    fn push_stage(&mut self, name: impl Into<String>, ok: bool, detail: impl Into<String>) {
+        self.stages.push(BleConnectProbeStage {
+            name: name.into(),
+            ok,
+            elapsed_ms: 0,
+            detail: Some(detail.into()),
+        });
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BleConnectProbeStage {
+    pub name: String,
+    pub ok: bool,
+    pub elapsed_ms: u128,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BleConnectProbeService {
+    pub uuid: String,
+    pub characteristics: Vec<String>,
+}
+
+async fn probe_stage<T, E, F>(
+    report: &mut BleConnectProbeReport,
+    name: &'static str,
+    timeout: std::time::Duration,
+    future: F,
+) -> Result<T, String>
+where
+    E: Display,
+    F: Future<Output = Result<T, E>>,
+{
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(timeout, future).await {
+        Ok(Ok(value)) => {
+            report.stages.push(BleConnectProbeStage {
+                name: name.to_string(),
+                ok: true,
+                elapsed_ms: started.elapsed().as_millis(),
+                detail: None,
+            });
+            Ok(value)
+        }
+        Ok(Err(error)) => {
+            let detail = error.to_string();
+            report.stages.push(BleConnectProbeStage {
+                name: name.to_string(),
+                ok: false,
+                elapsed_ms: started.elapsed().as_millis(),
+                detail: Some(detail.clone()),
+            });
+            Err(format!("{name}: {detail}"))
+        }
+        Err(_) => {
+            let detail = format!("timed out after {} ms", timeout.as_millis());
+            report.stages.push(BleConnectProbeStage {
+                name: name.to_string(),
+                ok: false,
+                elapsed_ms: started.elapsed().as_millis(),
+                detail: Some(detail.clone()),
+            });
+            Err(format!("{name}: {detail}"))
         }
     }
 }
