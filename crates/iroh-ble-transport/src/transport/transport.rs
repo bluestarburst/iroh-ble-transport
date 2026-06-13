@@ -46,6 +46,7 @@ const IROH_C2P_CHAR_UUID: Uuid = uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2");
 const IROH_P2C_CHAR_UUID: Uuid = uuid!("69726f03-8e45-4c2c-b3a5-331f3098b5c2");
 pub(crate) const IROH_PSM_CHAR_UUID: Uuid = uuid!("69726f04-8e45-4c2c-b3a5-331f3098b5c2");
 pub(crate) const IROH_VERSION_CHAR_UUID: Uuid = uuid!("69726f05-8e45-4c2c-b3a5-331f3098b5c2");
+const IROH_ENDPOINT_ID_CHAR_UUID: Uuid = uuid!("69726f06-8e45-4c2c-b3a5-331f3098b5c2");
 
 /// On-wire protocol version served by the peripheral on the VERSION
 /// characteristic and verified by the central immediately after connect.
@@ -173,7 +174,7 @@ fn iroh_key_uuid(endpoint_id: &EndpointId) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-fn build_gatt_services(key_uuid: Uuid) -> Vec<GattService> {
+fn build_gatt_services(endpoint_id: EndpointId, key_uuid: Uuid) -> Vec<GattService> {
     let characteristics = vec![
         GattCharacteristic {
             uuid: IROH_C2P_CHAR_UUID,
@@ -214,8 +215,14 @@ fn build_gatt_services(key_uuid: Uuid) -> Vec<GattService> {
         },
         GattService {
             uuid: key_uuid,
-            primary: false,
-            characteristics: vec![],
+            primary: true,
+            characteristics: vec![GattCharacteristic {
+                uuid: IROH_ENDPOINT_ID_CHAR_UUID,
+                properties: CharacteristicProperties::READ,
+                permissions: AttributePermissions::READ,
+                value: endpoint_id.to_string().into_bytes(),
+                descriptors: vec![],
+            }],
         },
     ]
 }
@@ -354,7 +361,7 @@ impl BleTransport {
             })?;
 
         let key_uuid = iroh_key_uuid(&local_id);
-        let services = build_gatt_services(key_uuid);
+        let services = build_gatt_services(local_id, key_uuid);
         register_gatt_services(&peripheral, &services).await?;
         let advertising_config = AdvertisingConfig {
             local_name: "iroh".to_string(),
@@ -591,6 +598,15 @@ impl BleTransport {
         Ok(service_uuid)
     }
 
+    /// Stop the active central scan without starting a replacement.
+    ///
+    /// Listener-only lab runs can call this after advertising starts so the
+    /// peripheral role is not competing with an opportunistic central scan on
+    /// the same Apple Bluetooth controller.
+    pub async fn stop_central_scan(&self) -> BleResult<()> {
+        self.central.stop_scan().await.map_err(Into::into)
+    }
+
     /// Restart the broad iroh BLE scan used for opportunistic peer discovery.
     pub async fn scan_broadly(&self) -> BleResult<()> {
         if let Err(error) = self.central.stop_scan().await {
@@ -663,9 +679,10 @@ impl BleTransport {
         &self,
         endpoint_id: EndpointId,
     ) -> BleConnectProbeReport {
+        let service_uuid = Self::service_uuid_for_endpoint(&endpoint_id);
         let mut report = BleConnectProbeReport {
             endpoint_id: endpoint_id.to_string(),
-            service_uuid: Self::service_uuid_for_endpoint(&endpoint_id).to_string(),
+            service_uuid: service_uuid.to_string(),
             device_id: None,
             stages: Vec::new(),
             services: Vec::new(),
@@ -680,6 +697,12 @@ impl BleTransport {
         };
         report.device_id = Some(device_id.to_string());
         report.push_stage("scan_hint", true, "scan hint found");
+
+        if let Err(error) = self.stop_central_scan().await {
+            report.push_stage("stop_scan", false, format!("{error}"));
+        } else {
+            report.push_stage("stop_scan", true, "central scan stopped");
+        }
 
         if let Err(error) = probe_stage(
             &mut report,
@@ -763,6 +786,37 @@ impl BleTransport {
             "validate_iroh_characteristics",
             true,
             format!("{} characteristics found", expected.len()),
+        );
+        let Some(advertised_service) = services.iter().find(|service| service.uuid == service_uuid)
+        else {
+            report.push_stage(
+                "validate_advertised_service",
+                false,
+                "advertised endpoint service missing from GATT table",
+            );
+            report.error = Some("advertised endpoint service missing from GATT table".to_string());
+            let _ = self.central.disconnect(&device_id).await;
+            return report;
+        };
+        let has_endpoint_id = advertised_service
+            .characteristics
+            .iter()
+            .any(|characteristic| characteristic.uuid == IROH_ENDPOINT_ID_CHAR_UUID);
+        if !has_endpoint_id {
+            report.push_stage(
+                "validate_advertised_service",
+                false,
+                "endpoint-id characteristic missing from advertised service",
+            );
+            report.error =
+                Some("endpoint-id characteristic missing from advertised service".to_string());
+            let _ = self.central.disconnect(&device_id).await;
+            return report;
+        }
+        report.push_stage(
+            "validate_advertised_service",
+            true,
+            "advertised endpoint service has endpoint-id characteristic",
         );
 
         if let Err(error) = probe_stage(
