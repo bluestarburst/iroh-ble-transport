@@ -244,6 +244,7 @@ pub struct BleMetricsSnapshot {
 
 pub struct BleTransport {
     local_id: EndpointId,
+    central: Arc<Central>,
     /// Sender half of the verified-endpoint channel. Cloned into every
     /// [`BleDedupHook`] returned from [`BleTransport::dedup_hook`]; the
     /// receiver half is consumed by the forwarder task spawned at
@@ -469,6 +470,7 @@ impl BleTransport {
 
         Ok(Arc::new(Self {
             local_id,
+            central,
             hook_tx,
             handle: RegistryHandle {
                 inbox: inbox_tx,
@@ -548,6 +550,55 @@ impl BleTransport {
     #[must_use]
     pub fn peer_store(&self) -> Arc<dyn PeerStore> {
         Arc::clone(&self.store)
+    }
+
+    /// Service UUID advertised by this node for iroh BLE discovery.
+    #[must_use]
+    pub fn advertised_service_uuid(&self) -> Uuid {
+        iroh_key_uuid(&self.local_id)
+    }
+
+    /// Service UUID a peer with `endpoint_id` advertises for iroh BLE discovery.
+    #[must_use]
+    pub fn service_uuid_for_endpoint(endpoint_id: &EndpointId) -> Uuid {
+        iroh_key_uuid(endpoint_id)
+    }
+
+    /// Restart scanning with a platform-level service filter for `endpoint_id`.
+    ///
+    /// Broad scans are unreliable on some CoreBluetooth stacks, especially
+    /// iOS. This narrows the active scan to the exact key-prefix service UUID
+    /// the peer should advertise, while the normal central event pump still
+    /// validates the advertised service list before recording a scan hint.
+    pub async fn scan_for_endpoint(&self, endpoint_id: EndpointId) -> BleResult<Uuid> {
+        let service_uuid = Self::service_uuid_for_endpoint(&endpoint_id);
+        if let Err(error) = self.central.stop_scan().await {
+            tracing::debug!(?error, "stop_scan before targeted scan ignored");
+        }
+        self.central
+            .start_scan(blew::central::ScanFilter {
+                services: vec![service_uuid],
+                ..Default::default()
+            })
+            .await?;
+        info!(
+            %endpoint_id,
+            %service_uuid,
+            "targeted iroh-ble scan started"
+        );
+        Ok(service_uuid)
+    }
+
+    /// Restart the broad iroh BLE scan used for opportunistic peer discovery.
+    pub async fn scan_broadly(&self) -> BleResult<()> {
+        if let Err(error) = self.central.stop_scan().await {
+            tracing::debug!(?error, "stop_scan before broad scan ignored");
+        }
+        self.central
+            .start_scan(blew::central::ScanFilter::default())
+            .await?;
+        info!("broad iroh-ble scan started");
+        Ok(())
     }
 
     #[must_use]
@@ -1074,6 +1125,18 @@ mod tests {
         bytes[0] = b;
         let secret = iroh_base::SecretKey::from_bytes(&bytes);
         secret.public()
+    }
+
+    #[test]
+    fn service_uuid_for_endpoint_embeds_key_prefix() {
+        let endpoint = endpoint_id_with_first_byte(0xA7);
+        let service_uuid = BleTransport::service_uuid_for_endpoint(&endpoint);
+
+        assert_eq!(&service_uuid.as_bytes()[..4], &[0x69, 0x72, 0x6f, 0x00]);
+        assert_eq!(
+            &service_uuid.as_bytes()[4..16],
+            &endpoint.as_bytes()[..KEY_PREFIX_LEN]
+        );
     }
 
     fn dev(s: &str) -> blew::DeviceId {
