@@ -637,6 +637,7 @@ impl BleTransport {
             .map(|(device_id, state)| BlePeerInfo {
                 device_id: device_id.clone(),
                 phase: BlePeerPhase::from(state.phase_kind),
+                phase_detail: state.phase_detail.clone(),
                 consecutive_failures: state.consecutive_failures,
                 connect_path: state.connect_path,
                 verified_endpoint: state.verified_endpoint,
@@ -650,6 +651,7 @@ impl BleTransport {
 pub struct BlePeerInfo {
     pub device_id: blew::DeviceId,
     pub phase: BlePeerPhase,
+    pub phase_detail: Option<String>,
     pub consecutive_failures: u32,
     pub connect_path: Option<ConnectPath>,
     pub verified_endpoint: Option<EndpointId>,
@@ -667,6 +669,7 @@ impl BlePeerInfo {
         Self {
             device_id,
             phase,
+            phase_detail: None,
             consecutive_failures,
             connect_path,
             verified_endpoint,

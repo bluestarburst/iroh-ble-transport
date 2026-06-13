@@ -1753,6 +1753,7 @@ impl Registry {
                 device_id.clone(),
                 PeerStateSummary {
                     phase_kind: PhaseKind::from(&entry.phase),
+                    phase_detail: phase_detail(&entry.phase),
                     tx_gen: entry.tx_gen,
                     consecutive_failures: entry.consecutive_failures,
                     connect_path,
@@ -1868,12 +1869,31 @@ pub struct SnapshotMaps {
 #[derive(Debug, Clone)]
 pub struct PeerStateSummary {
     pub phase_kind: PhaseKind,
+    pub phase_detail: Option<String>,
     pub tx_gen: u64,
     pub consecutive_failures: u32,
     pub connect_path: Option<crate::transport::peer::ConnectPath>,
     pub role: crate::transport::peer::ConnectRole,
     pub l2cap_upgrade_failed: bool,
     pub verified_endpoint: Option<iroh_base::EndpointId>,
+}
+
+fn phase_detail(phase: &PeerPhase) -> Option<String> {
+    match phase {
+        PeerPhase::Connecting { attempt, path, .. } => {
+            Some(format!("attempt={attempt} path={path:?}"))
+        }
+        PeerPhase::Handshaking { channel, .. } => Some(format!("path={:?}", channel.path)),
+        PeerPhase::Connected {
+            channel, upgrading, ..
+        } => Some(format!("path={:?} upgrading={upgrading}", channel.path)),
+        PeerPhase::Draining { reason, .. } => Some(format!("reason={reason:?}")),
+        PeerPhase::Reconnecting {
+            attempt, reason, ..
+        } => Some(format!("attempt={attempt} reason={reason:?}")),
+        PeerPhase::Dead { reason, .. } => Some(format!("reason={reason:?}")),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
