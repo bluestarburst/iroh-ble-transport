@@ -104,6 +104,13 @@ impl Registry {
                 datagram,
                 waker,
             ),
+            PeerCommand::EnsureConnecting {
+                device_id,
+                target_endpoint,
+                prefix,
+            } => {
+                self.handle_ensure_connecting(&mut actions, now, device_id, target_endpoint, prefix)
+            }
             PeerCommand::ConnectSucceeded { device_id, channel } => {
                 self.handle_connect_succeeded(&mut actions, now, device_id, channel);
             }
@@ -196,6 +203,41 @@ impl Registry {
             }
         }
         actions
+    }
+
+    fn handle_ensure_connecting(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        device_id: DeviceId,
+        target_endpoint: iroh_base::EndpointId,
+        prefix: crate::transport::peer::KeyPrefix,
+    ) {
+        let entry = self
+            .peers
+            .entry(device_id.clone())
+            .or_insert_with(|| PeerEntry::new(device_id.clone()));
+        entry.prefix = Some(prefix);
+        entry.target_endpoint = Some(target_endpoint);
+        entry.role = crate::transport::peer::ConnectRole::Central;
+
+        match &entry.phase {
+            PeerPhase::Connected { .. }
+            | PeerPhase::Connecting { .. }
+            | PeerPhase::Handshaking { .. } => {}
+            PeerPhase::Draining { .. } => {}
+            _ => {
+                entry.phase = PeerPhase::Connecting {
+                    attempt: 0,
+                    started: now,
+                    path: crate::transport::peer::ConnectPath::Gatt,
+                };
+                actions.push(PeerAction::StartConnect {
+                    device_id,
+                    attempt: 0,
+                });
+            }
+        }
     }
 
     fn handle_verified_endpoint(
@@ -2020,6 +2062,54 @@ mod tests {
                 }
             ),
             "peer should be connecting, got {:?}",
+            entry.phase
+        );
+    }
+
+    #[test]
+    fn ensure_connecting_revives_reserved_dead_peer_without_send() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("reserved-dead-peer");
+        let endpoint = endpoint_from_seed(43);
+        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint);
+
+        reg.peers.insert(device_id.clone(), {
+            let mut entry = PeerEntry::new(device_id.clone());
+            entry.prefix = Some(prefix);
+            entry.target_endpoint = Some(endpoint);
+            entry.phase = PeerPhase::Dead {
+                at: std::time::Instant::now(),
+                reason: crate::transport::peer::DeadReason::MaxRetries,
+            };
+            entry
+        });
+
+        let actions = reg.handle(PeerCommand::EnsureConnecting {
+            device_id: device_id.clone(),
+            target_endpoint: endpoint,
+            prefix,
+        });
+
+        assert!(matches!(
+            actions.as_slice(),
+            [PeerAction::StartConnect {
+                device_id: started,
+                attempt: 0,
+            }] if started == &device_id
+        ));
+        let entry = reg.peer(&device_id).expect("peer entry should remain");
+        assert_eq!(entry.target_endpoint, Some(endpoint));
+        assert_eq!(entry.prefix, Some(prefix));
+        assert!(
+            matches!(
+                entry.phase,
+                PeerPhase::Connecting {
+                    attempt: 0,
+                    path: crate::transport::peer::ConnectPath::Gatt,
+                    ..
+                }
+            ),
+            "ensure_connecting should restart from dead, got {:?}",
             entry.phase
         );
     }

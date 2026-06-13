@@ -618,6 +618,37 @@ impl BleTransport {
         self.routing.scan_hint_for_prefix(&prefix).is_some()
     }
 
+    /// If a targeted scan has seen `endpoint_id`, actively drive the
+    /// central-side GATT connection state machine for that peer.
+    ///
+    /// This is intentionally separate from iroh's transmit path: CoreBluetooth
+    /// can coalesce duplicate discoveries, and iroh may keep reusing the same
+    /// reservation after a failed attempt. A lab or reconnect loop can call this
+    /// to restart connection establishment from the latest scan hint instead of
+    /// waiting for another poll_send edge.
+    pub async fn ensure_connecting_for_endpoint(&self, endpoint_id: EndpointId) -> BleResult<bool> {
+        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
+        let Some(device_id) = self.routing.scan_hint_for_prefix(&prefix) else {
+            return Ok(false);
+        };
+        self.routing.reserve_outbound(endpoint_id);
+        self.handle
+            .inbox
+            .send(PeerCommand::EnsureConnecting {
+                device_id,
+                target_endpoint: endpoint_id,
+                prefix,
+            })
+            .await
+            .map_err(|_| {
+                BleError::Io(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "BLE registry is closed",
+                ))
+            })?;
+        Ok(true)
+    }
+
     /// Public-facing peer snapshot. Filters out `Unknown` (pre-state internal
     /// construction) and `Dead` (tombstones kept around for `DEAD_GC_TTL`
     /// dedup) so the returned list only contains peers that are actionable

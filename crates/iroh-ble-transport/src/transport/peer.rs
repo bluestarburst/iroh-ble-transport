@@ -273,6 +273,11 @@ pub enum PeerCommand {
         datagram: Bytes,
         waker: Waker,
     },
+    EnsureConnecting {
+        device_id: DeviceId,
+        target_endpoint: iroh_base::EndpointId,
+        prefix: KeyPrefix,
+    },
     Tick(Instant),
     ConnectSucceeded {
         device_id: DeviceId,
