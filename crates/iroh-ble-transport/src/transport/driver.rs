@@ -500,6 +500,9 @@ impl BlewDriver {
 #[async_trait]
 impl BleInterface for BlewDriver {
     async fn connect(&self, device_id: &blew::DeviceId) -> crate::error::BleResult<ChannelHandle> {
+        if let Err(error) = self.central.stop_scan().await {
+            tracing::debug!(?error, "stop_scan before connect ignored");
+        }
         self.central.connect(device_id).await?;
         // GATT is not usable until services are discovered and P2C notifications
         // are subscribed. Android/Apple both require this explicitly before
