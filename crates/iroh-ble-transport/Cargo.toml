@@ -14,7 +14,7 @@ categories = ["network-programming"]
 testing = ["blew/testing"]
 
 [dependencies]
-blew = "0.3"
+blew = { git = "https://github.com/bluestarburst/blew", branch = "codex/apple-retain-discovered-peripherals" }
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 tracing = "0.1"
@@ -38,7 +38,7 @@ tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 rand = "0.9"
-blew = { version = "0.3", features = ["testing"] }
+blew = { git = "https://github.com/bluestarburst/blew", branch = "codex/apple-retain-discovered-peripherals", features = ["testing"] }
 proptest = "1"
 
 [profile.test.package.proptest]

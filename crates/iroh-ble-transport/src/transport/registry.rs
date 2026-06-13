@@ -549,6 +549,7 @@ impl Registry {
                 }
             }
             PeerPhase::Discovered { .. } => SendDecision::StartAndEnqueue,
+            PeerPhase::Unknown if target_endpoint.is_some() => SendDecision::StartAndEnqueue,
             PeerPhase::Unknown
             | PeerPhase::PendingDial { .. }
             | PeerPhase::Connecting { .. }
@@ -1981,6 +1982,46 @@ mod tests {
             swap_tx,
             last_rx_at: crate::transport::peer::LivenessClock::new(),
         });
+    }
+
+    #[test]
+    fn reservation_backed_send_starts_connect_for_unknown_peer() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("reserved-peer");
+        let endpoint = endpoint_from_seed(42);
+
+        let actions = reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            target_endpoint: Some(endpoint),
+            tx_gen: 0,
+            datagram: bytes::Bytes::from_static(b"hello"),
+            waker: noop_waker(),
+        });
+
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                PeerAction::StartConnect {
+                    device_id: started,
+                    attempt: 0,
+                } if started == &device_id
+            )),
+            "reservation-backed send must begin the BLE connect; got {actions:?}"
+        );
+        let entry = reg.peer(&device_id).expect("peer entry should be created");
+        assert_eq!(entry.target_endpoint, Some(endpoint));
+        assert!(
+            matches!(
+                entry.phase,
+                PeerPhase::Connecting {
+                    attempt: 0,
+                    path: crate::transport::peer::ConnectPath::Gatt,
+                    ..
+                }
+            ),
+            "peer should be connecting, got {:?}",
+            entry.phase
+        );
     }
 
     #[derive(Debug, Clone)]
