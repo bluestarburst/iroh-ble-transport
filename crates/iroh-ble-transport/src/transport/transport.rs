@@ -8,6 +8,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use blew::gatt::props::{AttributePermissions, CharacteristicProperties};
@@ -19,10 +20,11 @@ use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item
 use iroh::endpoint::transports::{
     CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit,
 };
-use iroh_base::{CustomAddr, EndpointId, TransportAddr};
+use iroh_base::{CustomAddr, EndpointAddr, EndpointId, TransportAddr};
 use n0_watcher::Watchable;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
+use tokio_stream::StreamExt as _;
 use tracing::{info, warn};
 use uuid::{Uuid, uuid};
 
@@ -667,6 +669,56 @@ impl BleTransport {
         Ok(true)
     }
 
+    /// Prepare one exact BLE custom address for an Iroh connection attempt.
+    ///
+    /// The returned token is backed by a live BLE data pipe. Iroh still owns
+    /// the QUIC/TLS handshake and decides whether that pipe becomes an
+    /// authenticated routable path.
+    pub async fn prepare_endpoint_addr(
+        &self,
+        endpoint_id: EndpointId,
+        timeout: Duration,
+    ) -> BleResult<EndpointAddr> {
+        tokio::time::timeout(timeout, async {
+            self.scan_for_endpoint(endpoint_id).await?;
+            let mut resolved = self
+                .address_lookup()
+                .resolve(endpoint_id)
+                .ok_or_else(|| BleError::Protocol("BLE resolver is unavailable".to_string()))?;
+            let endpoint_addr = resolved
+                .next()
+                .await
+                .ok_or_else(|| {
+                    BleError::Protocol("BLE resolver ended before finding the peer".to_string())
+                })?
+                .map_err(|error| {
+                    BleError::Protocol(format!("BLE address resolution failed: {error}"))
+                })?
+                .into_endpoint_addr();
+            let stable_id = prepared_pipe_id(&endpoint_addr)?;
+
+            if !self.routing.has_live_pipe(stable_id) {
+                if !self.ensure_connecting_for_endpoint(endpoint_id).await? {
+                    return Err(BleError::Protocol(
+                        "BLE resolver produced an address without a scan hint".to_string(),
+                    ));
+                }
+                loop {
+                    if self.routing.has_live_pipe(stable_id) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+
+            Ok(endpoint_addr)
+        })
+        .await
+        .map_err(|_| BleError::Timeout {
+            stage: "prepare endpoint address",
+        })?
+    }
+
     /// Private hardware-lab probe that exercises the native BLE path up to the
     /// point where iroh would create a GATT data pipe.
     ///
@@ -893,6 +945,24 @@ impl BleTransport {
             })
             .collect()
     }
+}
+
+fn prepared_pipe_id(
+    endpoint_addr: &EndpointAddr,
+) -> BleResult<crate::transport::routing::StableConnId> {
+    if endpoint_addr.addrs.len() != 1 {
+        return Err(BleError::Protocol(
+            "BLE endpoint preparation must return exactly one custom address".to_string(),
+        ));
+    }
+    let Some(TransportAddr::Custom(custom)) = endpoint_addr.addrs.iter().next() else {
+        return Err(BleError::Protocol(
+            "BLE endpoint preparation returned a non-custom address".to_string(),
+        ));
+    };
+    let token = parse_token_addr(custom)
+        .map_err(|error| BleError::Protocol(format!("invalid BLE custom address: {error}")))?;
+    Ok(crate::transport::routing::StableConnId::from_raw(token))
 }
 
 #[derive(Debug, Clone)]
@@ -1472,6 +1542,29 @@ mod tests {
             &service_uuid.as_bytes()[4..16],
             &endpoint.as_bytes()[..KEY_PREFIX_LEN]
         );
+    }
+
+    #[test]
+    fn prepared_pipe_id_accepts_one_ble_custom_address() {
+        let endpoint_addr = EndpointAddr {
+            id: endpoint_id_with_first_byte(0xA8),
+            addrs: std::collections::BTreeSet::from([TransportAddr::Custom(token_custom_addr(42))]),
+        };
+
+        assert_eq!(prepared_pipe_id(&endpoint_addr).unwrap().as_u64(), 42);
+    }
+
+    #[test]
+    fn prepared_pipe_id_rejects_mixed_transport_candidates() {
+        let endpoint_addr = EndpointAddr {
+            id: endpoint_id_with_first_byte(0xA9),
+            addrs: std::collections::BTreeSet::from([
+                TransportAddr::Custom(token_custom_addr(42)),
+                TransportAddr::Ip("127.0.0.1:1234".parse().unwrap()),
+            ]),
+        };
+
+        assert!(prepared_pipe_id(&endpoint_addr).is_err());
     }
 
     fn dev(s: &str) -> blew::DeviceId {

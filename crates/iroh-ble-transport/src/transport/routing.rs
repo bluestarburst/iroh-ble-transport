@@ -396,6 +396,11 @@ impl Routing {
         self.inner.lock().pipes.values().cloned().collect()
     }
 
+    #[must_use]
+    pub(crate) fn has_live_pipe(&self, id: StableConnId) -> bool {
+        self.inner.lock().pipes.contains_key(&id)
+    }
+
     // ---------- scan_hint: KeyPrefix → DeviceId (dial-hint only) ----------
 
     /// Record that `prefix` was last seen advertising from `device`.
