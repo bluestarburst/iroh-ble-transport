@@ -36,10 +36,15 @@ defaults (a dedup hook and an address lookup):
 use iroh::endpoint::presets;
 use iroh::{Endpoint, SecretKey};
 use iroh_ble_transport::BleTransport;
+use std::time::Duration;
 
 async fn bind_ble_endpoint() -> anyhow::Result<Endpoint> {
     let secret_key = SecretKey::generate();
-    let ble = BleTransport::builder().build(secret_key.public()).await?;
+    let ble = BleTransport::builder()
+        // Keep this above the endpoint's longest QUIC keepalive interval.
+        .connected_idle_deadline(Duration::from_secs(105))
+        .build(secret_key.public())
+        .await?;
 
     let endpoint = Endpoint::builder(presets::N0DisableRelay)
         .hooks(ble.dedup_hook())
