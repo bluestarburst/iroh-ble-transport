@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use crate::transport::driver::Driver;
 use crate::transport::interface::BleInterface;
 use crate::transport::peer::{PeerAction, PeerCommand, PeerEntry, PeerPhase};
-use crate::transport::transport::L2capPolicy;
+use crate::transport::transport::{DEFAULT_CONNECTED_IDLE_DEADLINE, L2capPolicy};
 
 const MAX_CONNECT_ATTEMPTS: u32 = 15;
 const DRAINING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -24,18 +24,16 @@ const DEAD_GC_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 pub(crate) const L2CAP_SELECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 /// Max time a `Connected` pipe may go without producing an inbound datagram
 /// before the registry treats it as wedged and synthesizes `Stalled`. The
-/// wire-level QUIC keepalive runs at 5 s so a healthy link should bump its
-/// `LivenessClock` at roughly that cadence (packets flow both ways); 45 s
-/// is ~9× that and tolerates substantial jitter / transient scan stalls
-/// without false-positiving. Covers the wedged-pipe case where the peer's
-/// BLE stack freezes without emitting a disconnect callback (observed on
-/// Android LE in low-power mode and during iOS background suspension).
-pub(crate) const CONNECTED_IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
-
+/// The default assumes a QUIC keepalive shorter than 45 s. Hosts using a
+/// longer keepalive configure this deadline when constructing the transport.
+/// This covers the wedged-pipe case where the peer's BLE stack freezes without
+/// emitting a disconnect callback (observed on Android LE in low-power mode
+/// and during iOS background suspension).
 #[derive(Debug)]
 pub struct Registry {
     peers: HashMap<DeviceId, PeerEntry>,
     l2cap_policy: L2capPolicy,
+    connected_idle_deadline: Duration,
     /// Prefixes whose identity has been verified by iroh's QUIC handshake.
     /// Populated by `VerifiedEndpoint`; consulted by `handle_advertised`
     /// (to suppress redundant redials of a verified peer) and by the
@@ -47,10 +45,23 @@ pub struct Registry {
 
 impl Registry {
     pub fn new(l2cap_policy: L2capPolicy, my_endpoint: iroh_base::EndpointId) -> Self {
+        Self::new_with_connected_idle_deadline(
+            l2cap_policy,
+            my_endpoint,
+            DEFAULT_CONNECTED_IDLE_DEADLINE,
+        )
+    }
+
+    pub(crate) fn new_with_connected_idle_deadline(
+        l2cap_policy: L2capPolicy,
+        my_endpoint: iroh_base::EndpointId,
+        connected_idle_deadline: Duration,
+    ) -> Self {
         let my_prefix = crate::transport::routing::prefix_from_endpoint(&my_endpoint);
         Self {
             peers: HashMap::new(),
             l2cap_policy,
+            connected_idle_deadline,
             verified_prefixes: HashMap::new(),
             my_endpoint,
             my_prefix,
@@ -1194,14 +1205,15 @@ impl Registry {
                 }
                 PeerPhase::Connected { .. } => {
                     // Wedged-pipe check: if the pipe's LivenessClock hasn't
-                    // bumped in CONNECTED_IDLE_DEADLINE we synthesize Stalled
+                    // bumped within the configured idle deadline we synthesize Stalled
                     // so the routing layer's pinning can release and the
                     // peer can be rediscovered under a new DeviceId (e.g.
                     // after a MAC rotation on the return trip). No pipe
                     // handles yet → can't observe liveness; leave it alone.
                     entry.pipe.as_ref().and_then(|h| {
                         let elapsed = tick_now.saturating_duration_since(h.last_rx_at.last());
-                        (elapsed > CONNECTED_IDLE_DEADLINE).then_some(TickAction::ConnectedWedged)
+                        (elapsed > self.connected_idle_deadline)
+                            .then_some(TickAction::ConnectedWedged)
                     })
                 }
                 _ => None,
@@ -3653,7 +3665,8 @@ mod tests {
             e
         });
 
-        let tick_now = bumped_at + CONNECTED_IDLE_DEADLINE + std::time::Duration::from_millis(10);
+        let tick_now =
+            bumped_at + DEFAULT_CONNECTED_IDLE_DEADLINE + std::time::Duration::from_millis(10);
         let actions = reg.handle(PeerCommand::Tick(tick_now));
 
         assert!(
@@ -3690,6 +3703,60 @@ mod tests {
     #[test]
     fn tick_wedged_l2cap_pipe_drains_and_closes_channel_after_idle_deadline() {
         tick_wedged_pipe_test_body(crate::transport::peer::ConnectPath::L2cap);
+    }
+
+    #[test]
+    fn configured_idle_deadline_preserves_a_quiet_healthy_pipe() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, LivenessClock, PipeHandles};
+
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0u8; 32]).public();
+        let deadline = Duration::from_secs(105);
+        let mut reg =
+            Registry::new_with_connected_idle_deadline(L2capPolicy::Disabled, endpoint, deadline);
+        let device_id = blew::DeviceId::from("dev-quiet-gatt");
+        let clock = LivenessClock::new();
+        let bumped_at = clock.last();
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(4);
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel(4);
+        let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel(1);
+
+        reg.peers.insert(device_id.clone(), {
+            let mut entry = PeerEntry::new(device_id.clone());
+            entry.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 43,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+                upgrading: false,
+            };
+            entry.pipe = Some(PipeHandles {
+                outbound_tx,
+                inbound_tx,
+                swap_tx,
+                last_rx_at: clock,
+            });
+            entry
+        });
+
+        let before_deadline = reg.handle(PeerCommand::Tick(
+            bumped_at + DEFAULT_CONNECTED_IDLE_DEADLINE + Duration::from_secs(1),
+        ));
+        assert!(before_deadline.is_empty());
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Connected { .. }
+        ));
+
+        let after_deadline = reg.handle(PeerCommand::Tick(
+            bumped_at + deadline + Duration::from_millis(10),
+        ));
+        assert!(
+            after_deadline
+                .iter()
+                .any(|action| matches!(action, PeerAction::CloseChannel { .. }))
+        );
     }
 
     #[test]

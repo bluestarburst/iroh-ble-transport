@@ -43,6 +43,13 @@ use crate::transport::watchdog::run_watchdog;
 /// Unique transport discriminator — ASCII "BLE".
 pub const BLE_TRANSPORT_ID: u64 = 0x42_4C_45;
 
+/// Default time a connected BLE pipe may remain silent before it is treated
+/// as wedged.
+///
+/// Hosts with a longer QUIC keepalive interval should override this through
+/// [`BleTransportBuilder::connected_idle_deadline`].
+pub const DEFAULT_CONNECTED_IDLE_DEADLINE: Duration = Duration::from_secs(45);
+
 const IROH_SERVICE_UUID: Uuid = uuid!("69726f01-8e45-4c2c-b3a5-331f3098b5c2");
 const IROH_C2P_CHAR_UUID: Uuid = uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2");
 const IROH_P2C_CHAR_UUID: Uuid = uuid!("69726f03-8e45-4c2c-b3a5-331f3098b5c2");
@@ -78,6 +85,7 @@ pub enum L2capPolicy {
 /// - [`InMemoryPeerStore`] (non-durable across restarts)
 pub struct BleTransportBuilder {
     l2cap_policy: L2capPolicy,
+    connected_idle_deadline: Duration,
     central: Option<Arc<Central>>,
     peripheral: Option<Arc<Peripheral>>,
     peer_store: Option<Arc<dyn PeerStore>>,
@@ -87,6 +95,7 @@ impl BleTransportBuilder {
     fn new() -> Self {
         Self {
             l2cap_policy: L2capPolicy::default(),
+            connected_idle_deadline: DEFAULT_CONNECTED_IDLE_DEADLINE,
             central: None,
             peripheral: None,
             peer_store: None,
@@ -97,6 +106,18 @@ impl BleTransportBuilder {
     #[must_use]
     pub fn l2cap_policy(mut self, policy: L2capPolicy) -> Self {
         self.l2cap_policy = policy;
+        self
+    }
+
+    /// Set how long a connected pipe may receive no datagrams before the
+    /// transport treats it as wedged. Defaults to
+    /// [`DEFAULT_CONNECTED_IDLE_DEADLINE`].
+    ///
+    /// Choose a value longer than the endpoint's longest expected QUIC
+    /// keepalive interval so a healthy quiet connection is not recycled.
+    #[must_use]
+    pub fn connected_idle_deadline(mut self, deadline: Duration) -> Self {
+        self.connected_idle_deadline = deadline;
         self
     }
 
@@ -153,7 +174,15 @@ impl BleTransportBuilder {
         let store = self
             .peer_store
             .unwrap_or_else(|| Arc::new(InMemoryPeerStore::new()));
-        BleTransport::construct(endpoint_id, central, peripheral, store, self.l2cap_policy).await
+        BleTransport::construct(
+            endpoint_id,
+            central,
+            peripheral,
+            store,
+            self.l2cap_policy,
+            self.connected_idle_deadline,
+        )
+        .await
     }
 }
 
@@ -161,6 +190,7 @@ impl std::fmt::Debug for BleTransportBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BleTransportBuilder")
             .field("l2cap_policy", &self.l2cap_policy)
+            .field("connected_idle_deadline", &self.connected_idle_deadline)
             .field("central", &self.central.is_some())
             .field("peripheral", &self.peripheral.is_some())
             .field("peer_store", &self.peer_store.is_some())
@@ -348,6 +378,7 @@ impl BleTransport {
         peripheral: Arc<Peripheral>,
         store: Arc<dyn PeerStore>,
         l2cap_policy: L2capPolicy,
+        connected_idle_deadline: Duration,
     ) -> BleResult<Arc<Self>> {
         central
             .wait_ready(std::time::Duration::from_secs(5))
@@ -429,7 +460,11 @@ impl BleTransport {
             }
         }
 
-        let registry = Registry::new(l2cap_policy, local_id);
+        let registry = Registry::new_with_connected_idle_deadline(
+            l2cap_policy,
+            local_id,
+            connected_idle_deadline,
+        );
         let snap_for_actor = Arc::clone(&snapshots);
         let wakers_for_actor = Arc::clone(&inbox_capacity_wakers);
         let routing_for_actor = Arc::clone(&routing);

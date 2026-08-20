@@ -25,5 +25,5 @@ pub use peer::{ConnectPath, KEY_PREFIX_LEN, KeyPrefix};
 pub use store::{InMemoryPeerStore, PeerSnapshot, PeerStore};
 pub use transport::{
     BleConnectProbeReport, BleConnectProbeService, BleConnectProbeStage, BlePeerInfo, BlePeerPhase,
-    BleTransport, BleTransportBuilder, L2capPolicy,
+    BleTransport, BleTransportBuilder, DEFAULT_CONNECTED_IDLE_DEADLINE, L2capPolicy,
 };
